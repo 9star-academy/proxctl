@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
@@ -10,9 +11,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,8 +28,13 @@ type Server struct {
 	CertManager *autocert.Manager
 	httpServer  *http.Server
 	httpsServer *http.Server
-	proxies     sync.Map // domain -> *httputil.ReverseProxy
+	proxies     sync.Map // domain -> cachedProxy
 	Logger      *log.Logger
+}
+
+type cachedProxy struct {
+	target string
+	proxy  *httputil.ReverseProxy
 }
 
 func NewServer(cfg *config.Config, logger *log.Logger) *Server {
@@ -69,6 +75,23 @@ func (s *Server) hostPolicy(ctx context.Context, host string) error {
 
 // Start launches the HTTP and HTTPS listeners.
 func (s *Server) Start(ctx context.Context) error {
+	if err := os.MkdirAll(s.Config.CertDir, 0700); err != nil {
+		return fmt.Errorf("创建证书目录失败: %w", err)
+	}
+	httpListener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Config.HTTPPort))
+	if err != nil {
+		return fmt.Errorf("HTTP 监听失败: %w", err)
+	}
+	defer httpListener.Close()
+	httpsListener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Config.HTTPSPort))
+	if err != nil {
+		return fmt.Errorf("HTTPS 监听失败: %w", err)
+	}
+	defer httpsListener.Close()
+	return s.serve(ctx, httpListener, httpsListener)
+}
+
+func (s *Server) serve(ctx context.Context, httpListener, httpsListener net.Listener) error {
 	httpMux := http.NewServeMux()
 
 	// 1. HTTP Handler: Handles ACME HTTP-01 challenge, redirects all other requests to HTTPS
@@ -78,6 +101,9 @@ func (s *Server) Start(ctx context.Context) error {
 			host = r.Host
 		}
 
+		if s.Config.HTTPSPort != 443 && s.Config.HTTPSPort != 0 {
+			host = net.JoinHostPort(host, strconv.Itoa(s.Config.HTTPSPort))
+		}
 		targetURL := "https://" + host + r.RequestURI
 		http.Redirect(w, r, targetURL, http.StatusMovedPermanently)
 	})
@@ -97,35 +123,64 @@ func (s *Server) Start(ctx context.Context) error {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
-		TLSConfig: &tls.Config{
-			GetCertificate: s.CertManager.GetCertificate,
-			MinVersion:     tls.VersionTLS12,
-		},
+		TLSConfig:    s.CertManager.TLSConfig(),
 	}
+	s.httpsServer.TLSConfig.MinVersion = tls.VersionTLS12
 
 	errChan := make(chan error, 2)
 
-	go func() {
-		s.Logger.Printf("HTTP 服务监听于 :%d (ACME 验证与 HTTPS 重定向)", s.Config.HTTPPort)
-		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		s.Logger.Printf("HTTP 服务监听于 %s (ACME 验证与 HTTPS 重定向)", httpListener.Addr())
+		if err := s.httpServer.Serve(httpListener); err != nil && err != http.ErrServerClosed {
 			errChan <- fmt.Errorf("HTTP 监听失败: %w", err)
 		}
-	}()
+	})
 
-	go func() {
-		s.Logger.Printf("HTTPS 服务监听于 :%d (自动证书与业务代理)", s.Config.HTTPSPort)
-		if err := s.httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+	workers.Go(func() {
+		s.Logger.Printf("HTTPS 服务监听于 %s (自动证书与业务代理)", httpsListener.Addr())
+		if err := s.httpsServer.ServeTLS(httpsListener, "", ""); err != nil && err != http.ErrServerClosed {
 			errChan <- fmt.Errorf("HTTPS 监听失败: %w", err)
 		}
-	}()
+	})
+	reloadCtx, cancelReload := context.WithCancel(ctx)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	workers.Go(func() { s.reloadLoop(reloadCtx, ticker.C) })
+	var serveErr error
 
 	select {
 	case <-ctx.Done():
-		s.Shutdown()
-		return nil
 	case err := <-errChan:
-		s.Shutdown()
-		return err
+		serveErr = err
+	}
+	cancelReload()
+	s.Shutdown()
+	workers.Wait()
+	return serveErr
+}
+
+func (s *Server) reloadLoop(ctx context.Context, ticks <-chan time.Time) {
+	lastError := ""
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticks:
+			changed, err := s.Config.ReloadRules()
+			if err != nil {
+				if err.Error() != lastError {
+					s.Logger.Printf("规则重载失败，保留上次有效配置: %v", err)
+				}
+				lastError = err.Error()
+				continue
+			}
+			lastError = ""
+			if changed {
+				s.proxies.Clear()
+				s.Logger.Printf("域名规则已重新加载 (%d 条)", len(s.Config.ListRules()))
+			}
+		}
 	}
 }
 
@@ -158,22 +213,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Basic Auth check
-	if rule.Auth != "" {
-		if !checkBasicAuth(r, rule.Auth) {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted by proxctl"`)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-	}
-
-	// 2. CORS headers
+	// CORS preflight carries no Basic Auth credentials. Actual requests still
+	// pass through authentication, including ordinary OPTIONS requests.
 	if rule.CORS {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
-		if r.Method == http.MethodOptions {
+		if r.Method == http.MethodOptions && r.Header.Get("Origin") != "" && r.Header.Get("Access-Control-Request-Method") != "" {
 			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	// Basic Auth check
+	if rule.Auth != "" {
+		if !checkBasicAuth(r, rule.Auth) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted by proxctl"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 	}
@@ -192,37 +248,30 @@ func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request, rule *config
 	val, ok := s.proxies.Load(rule.Domain)
 	var proxy *httputil.ReverseProxy
 
-	if ok {
-		proxy = val.(*httputil.ReverseProxy)
+	if ok && val.(cachedProxy).target == rule.Target {
+		proxy = val.(cachedProxy).proxy
 	} else {
-		target := rule.Target
-		if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
-			target = "http://" + target
-		}
-		targetURL, err := url.Parse(target)
+		targetURL, err := config.TargetURL(rule.Target)
 		if err != nil {
 			http.Error(w, "Target URL invalid", http.StatusInternalServerError)
 			return
 		}
 
-		proxy = httputil.NewSingleHostReverseProxy(targetURL)
-		origDirector := proxy.Director
-		proxy.Director = func(req *http.Request) {
-			origDirector(req)
-			req.Host = targetURL.Host
-			req.Header.Set("X-Forwarded-Host", r.Host)
-			req.Header.Set("X-Forwarded-Proto", "https")
-			if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-				req.Header.Set("X-Real-IP", clientIP)
+		proxy = &httputil.ReverseProxy{Rewrite: func(req *httputil.ProxyRequest) {
+			req.SetURL(targetURL)
+			req.SetXForwarded()
+			req.Out.Header.Del("X-Real-IP")
+			if clientIP, _, err := net.SplitHostPort(req.In.RemoteAddr); err == nil {
+				req.Out.Header.Set("X-Real-IP", clientIP)
 			}
-		}
+		}}
 
 		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 			s.Logger.Printf("代理请求失败 [%s -> %s]: %v", rule.Domain, rule.Target, err)
 			http.Error(w, fmt.Sprintf("proxctl: 无法连接目标后端 %s: %v", rule.Target, err), http.StatusBadGateway)
 		}
 
-		s.proxies.Store(rule.Domain, proxy)
+		s.proxies.Store(rule.Domain, cachedProxy{target: rule.Target, proxy: proxy})
 	}
 
 	proxy.ServeHTTP(w, r)
@@ -273,5 +322,5 @@ func checkBasicAuth(r *http.Request, expected string) bool {
 		return false
 	}
 
-	return string(payload) == expected
+	return subtle.ConstantTimeCompare(payload, []byte(expected)) == 1
 }

@@ -20,19 +20,14 @@ if [ "$OS" != "linux" ] && [ "$OS" != "darwin" ]; then
   exit 1
 fi
 
-TAG="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "latest")"
-
-if [ -z "$TAG" ] || [ "$TAG" = "latest" ]; then
-  TAG="v1.0.1"
-fi
-
 FILE="${BIN_NAME}-${OS}-${ARCH}"
-URL="https://github.com/${REPO}/releases/download/${TAG}/${FILE}"
+URL="https://github.com/${REPO}/releases/latest/download/${FILE}"
 
-echo "==> 正在从 GitHub 下载 ${BIN_NAME} (${TAG}) [${OS}/${ARCH}]..."
+echo "==> 正在从 GitHub 下载 ${BIN_NAME} 最新发布版 [${OS}/${ARCH}]..."
 TMP_FILE="$(mktemp)"
+trap 'rm -f "$TMP_FILE"' EXIT
 if curl -fsSL "$URL" -o "$TMP_FILE"; then
-  chmod +x "$TMP_FILE"
+  chmod 0755 "$TMP_FILE"
   if [ "$(id -u)" -eq 0 ]; then
     mv "$TMP_FILE" "${INSTALL_DIR}/${BIN_NAME}"
   else
@@ -41,7 +36,6 @@ if curl -fsSL "$URL" -o "$TMP_FILE"; then
   fi
   echo "✔ ${BIN_NAME} 安装成功！运行 'proxctl --help' 开始使用。"
 else
-  rm -f "$TMP_FILE"
   echo "❌ 下载失败: 无法下载 $URL"
   exit 1
 fi

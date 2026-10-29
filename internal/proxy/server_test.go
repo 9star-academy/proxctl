@@ -91,9 +91,10 @@ func TestBasicAuth(t *testing.T) {
 		Rules:   make(map[string]*config.Rule),
 	}
 	cfg.AddRule(&config.Rule{
-		Domain: "admin.local",
-		Type:   config.TypeStatic,
-		Auth:   "admin:secret",
+		Domain:    "admin.local",
+		Type:      config.TypeStatic,
+		Auth:      "admin:secret",
+		StaticDir: t.TempDir(),
 	})
 
 	server := NewServer(cfg, nil)

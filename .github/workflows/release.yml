@@ -19,10 +19,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version-file: go.mod
 
       - name: Run Tests
-        run: go test -v ./...
+        run: |
+          go vet ./...
+          bash -n scripts/install.sh
+          go test -race -timeout 90s ./...
 
       - name: Build Matrix Binaries
         run: |
@@ -35,12 +38,43 @@ jobs:
           CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/proxctl-darwin-amd64 ./cmd/proxctl
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/proxctl-darwin-arm64 ./cmd/proxctl
 
+          awk -v tag="$TAG" '$0 == "## " tag { capture=1; next } capture && /^## / { exit } capture { print }' CHANGELOG.md > dist/RELEASE_NOTES.md
+          test -s dist/RELEASE_NOTES.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: dist/RELEASE_NOTES.md
+          make_latest: true
+          fail_on_unmatched_files: true
           files: |
             dist/proxctl-linux-amd64
             dist/proxctl-linux-arm64
             dist/proxctl-darwin-amd64
             dist/proxctl-darwin-arm64
           generate_release_notes: true
+
+  verify-install:
+    name: Verify public install (${{ matrix.os }})
+    needs: release
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install from the public one-line command
+        shell: bash
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/9star-academy/proxctl/main/scripts/install.sh | sudo bash
+          test "$(/usr/local/bin/proxctl --version)" = "proxctl version ${GITHUB_REF_NAME}"
+      - name: Verify Linux systemd and published binary
+        if: runner.os == 'Linux'
+        run: python3 scripts/verify-install.py --binary /usr/local/bin/proxctl --expected-version "$GITHUB_REF_NAME" --systemd
+      - name: Verify macOS foreground server and published binary
+        if: runner.os == 'macOS'
+        run: python3 scripts/verify-install.py --binary /usr/local/bin/proxctl --expected-version "$GITHUB_REF_NAME"
