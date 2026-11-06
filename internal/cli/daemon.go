@@ -22,7 +22,7 @@ func systemdQuote(value string) string {
 	return strconv.Quote(value)
 }
 
-func (a *App) runDaemon(ctx context.Context, args []string) int {
+func (a *App) runDaemon(ctx context.Context, args []string, configPath string) int {
 	if len(args) != 1 {
 		fmt.Fprintln(a.Err, "用法: proxctl daemon <install|start|stop|restart|status>")
 		return 1
@@ -59,6 +59,9 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 			return 1
 		}
 		return 0
+	}
+	if !a.loadConfig(configPath) {
+		return 1
 	}
 	unit := fmt.Sprintf(`[Unit]
 Description=proxctl - Reverse proxy and automatic HTTPS

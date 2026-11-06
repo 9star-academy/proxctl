@@ -78,10 +78,20 @@ func DefaultCertDir() string {
 
 // Load reads or initializes the config file.
 func Load(path string) (*Config, error) {
-	return load(path, true)
+	return load(path, loadOptions{initialize: true, protectPermissions: true})
 }
 
-func load(path string, initialize bool) (*Config, error) {
+// LoadReadOnly reads an existing config without changing file permissions.
+func LoadReadOnly(path string) (*Config, error) {
+	return load(path, loadOptions{})
+}
+
+type loadOptions struct {
+	initialize         bool
+	protectPermissions bool
+}
+
+func load(path string, opts loadOptions) (*Config, error) {
 	if path == "" {
 		path = DefaultConfigPath()
 	}
@@ -102,7 +112,7 @@ func load(path string, initialize bool) (*Config, error) {
 	cfg.base = configSettings(cfg)
 
 	file, err := os.Open(path)
-	if os.IsNotExist(err) && initialize {
+	if os.IsNotExist(err) && opts.initialize {
 		return cfg, nil
 	}
 	if err != nil {
@@ -116,7 +126,7 @@ func load(path string, initialize bool) (*Config, error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("配置路径必须为普通文件: %s", path)
 	}
-	if info.Mode().Perm() != 0600 {
+	if opts.protectPermissions && info.Mode().Perm() != 0600 {
 		if err := file.Chmod(0600); err != nil {
 			return nil, fmt.Errorf("保护配置文件权限失败: %w", err)
 		}
@@ -225,7 +235,7 @@ func (c *Config) ListRules() []*Rule {
 // ReloadRules replaces only routing rules. Listener and ACME settings need restart.
 // A missing, malformed or invalid file leaves the last valid snapshot untouched.
 func (c *Config) ReloadRules() (bool, error) {
-	next, err := load(c.filePath, false)
+	next, err := load(c.filePath, loadOptions{protectPermissions: true})
 	if err != nil {
 		return false, err
 	}

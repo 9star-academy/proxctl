@@ -6,59 +6,113 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    name: Build & Release
+  build:
+    name: Build release assets
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
-      - name: Run Tests
+      - name: Run tests
         run: |
           go vet ./...
           bash -n scripts/install.sh
           go test -race -timeout 90s ./...
 
-      - name: Build Matrix Binaries
+      - name: Build and checksum release assets
         run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           mkdir -p dist
-          TAG="${GITHUB_REF#refs/tags/}"
-          LDFLAGS="-s -w -X main.version=${TAG}"
+          for os in linux darwin; do
+            for arch in amd64 arm64; do
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build \
+                -ldflags="-s -w -X main.version=$GITHUB_REF_NAME" \
+                -o "dist/proxctl-$os-$arch" ./cmd/proxctl
+            done
+          done
 
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/proxctl-linux-amd64 ./cmd/proxctl
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/proxctl-linux-arm64 ./cmd/proxctl
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/proxctl-darwin-amd64 ./cmd/proxctl
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/proxctl-darwin-arm64 ./cmd/proxctl
-
-          awk -v tag="$TAG" '$0 == "## " tag { capture=1; next } capture && /^## / { exit } capture { print }' CHANGELOG.md > dist/RELEASE_NOTES.md
+          awk -v tag="$GITHUB_REF_NAME" '$0 == "## " tag { capture=1; next } capture && /^## / { exit } capture { print }' CHANGELOG.md > dist/RELEASE_NOTES.md
           test -s dist/RELEASE_NOTES.md
+          cp scripts/install.sh dist/install.sh
+          (cd dist && sha256sum proxctl-* install.sh > SHA256SUMS)
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          body_path: dist/RELEASE_NOTES.md
-          make_latest: true
-          fail_on_unmatched_files: true
-          files: |
-            dist/proxctl-linux-amd64
-            dist/proxctl-linux-arm64
-            dist/proxctl-darwin-amd64
-            dist/proxctl-darwin-arm64
-          generate_release_notes: true
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+
+  verify-candidate:
+    name: Verify candidate (${{ matrix.asset }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: proxctl-linux-amd64
+          - os: ubuntu-24.04-arm
+            asset: proxctl-linux-arm64
+          - os: macos-15-intel
+            asset: proxctl-darwin-amd64
+          - os: macos-15
+            asset: proxctl-darwin-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist/
+      - name: Exercise the exact release binary
+        shell: bash
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          binary="$PWD/dist/$ASSET"
+          args=(--binary "$binary" --expected-version "$GITHUB_REF_NAME")
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            (cd dist && sha256sum --strict --check SHA256SUMS)
+            args+=(--systemd)
+          else
+            (cd dist && shasum -a 256 -c SHA256SUMS)
+          fi
+          chmod +x "$binary"
+          python3 scripts/verify-install.py "${args[@]}"
+
+  release:
+    name: Publish verified release assets
+    needs: verify-candidate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist/
+      - name: Publish GitHub Release
+        shell: bash
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha256sum --strict --check SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" \
+            proxctl-linux-amd64 proxctl-linux-arm64 proxctl-darwin-amd64 proxctl-darwin-arm64 \
+            SHA256SUMS install.sh --verify-tag --latest --title "$GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md --generate-notes
 
   verify-install:
     name: Verify public install (${{ matrix.os }})
     needs: release
-    permissions:
-      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -67,14 +121,17 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Install from the public one-line command
+      - name: Install the published tag as a non-root user
         shell: bash
         run: |
-          curl -fsSL https://raw.githubusercontent.com/9star-academy/proxctl/main/scripts/install.sh | sudo bash
-          test "$(/usr/local/bin/proxctl --version)" = "proxctl version ${GITHUB_REF_NAME}"
-      - name: Verify Linux systemd and published binary
-        if: runner.os == 'Linux'
-        run: python3 scripts/verify-install.py --binary /usr/local/bin/proxctl --expected-version "$GITHUB_REF_NAME" --systemd
-      - name: Verify macOS foreground server and published binary
-        if: runner.os == 'macOS'
-        run: python3 scripts/verify-install.py --binary /usr/local/bin/proxctl --expected-version "$GITHUB_REF_NAME"
+          test "$(id -u)" -ne 0
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install.sh"
+          curl -fsSL "$url" | bash -s -- --version "$GITHUB_REF_NAME"
+          args=(--binary /usr/local/bin/proxctl --expected-version "$GITHUB_REF_NAME")
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            test "$(stat -c '%u %a' /usr/local/bin/proxctl)" = "0 755"
+            args+=(--systemd)
+          else
+            test "$(stat -f '%u %Lp' /usr/local/bin/proxctl)" = "0 755"
+          fi
+          python3 scripts/verify-install.py "${args[@]}"

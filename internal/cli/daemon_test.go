@@ -65,3 +65,27 @@ func TestDaemonActionsAndWriteFailure(t *testing.T) {
 		t.Fatal("failure not explained")
 	}
 }
+
+func TestDaemonControlsServiceWithBrokenConfig(t *testing.T) {
+	a, _, errOut := testApp(t)
+	path := filepath.Join(t.TempDir(), "broken.json")
+	if err := os.WriteFile(path, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	a.daemon = &daemonManager{run: func(_ context.Context, args ...string) error {
+		calls = append(calls, strings.Join(args, " "))
+		return nil
+	}}
+	for _, action := range []string{"status", "stop", "start", "restart"} {
+		if code := a.Run(context.Background(), []string{"--config", path, "daemon", action}); code != 0 {
+			t.Errorf("%s exit=%d stderr=%s", action, code, errOut)
+		}
+	}
+	if code := a.Run(context.Background(), []string{"--config", path, "daemon", "install"}); code != 1 || !strings.Contains(errOut.String(), "解析配置文件失败") {
+		t.Errorf("install exit=%d stderr=%s", code, errOut)
+	}
+	if !reflect.DeepEqual(calls, []string{"status proxctl", "stop proxctl", "start proxctl", "restart proxctl"}) {
+		t.Errorf("systemctl calls=%q", calls)
+	}
+}

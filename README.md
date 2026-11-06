@@ -35,6 +35,7 @@
 | **静态站点** | 托管前端构建产物，使用 `--spa` 开启单页应用路由回退 |
 | **认证与跨域** | 支持 Basic Auth；反向代理可通过 `--cors` 处理跨域响应与预检 |
 | **规则热重载** | 每秒检查配置，新增、修改、删除域名规则无需重启 |
+| **一键排障** | 用 `doctor` 检查配置、DNS、后端和 HTTPS 证书 |
 | **服务管理** | 集成 Linux systemd，支持开机自启及启动、停止、重启、状态查询 |
 
 ## 安装
@@ -45,11 +46,11 @@
 | macOS | amd64 / arm64 | 使用 `proxctl serve` 前台运行 |
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/9star-academy/proxctl/main/scripts/install.sh | sudo bash
+curl -fsSL https://github.com/9star-academy/proxctl/releases/latest/download/install.sh | sudo bash
 proxctl --version
 ```
 
-安装脚本将 GitHub **最新 Release** 的二进制下载到 `/usr/local/bin/proxctl`，不会自动启动服务。也可从 [Releases](https://github.com/9star-academy/proxctl/releases) 手动下载对应平台的文件。
+安装脚本从 GitHub **最新 Release** 下载对应平台的二进制，校验 SHA-256 后原子替换 `/usr/local/bin/proxctl`。服务继续使用当前进程，重启后才会使用新版本。历史版本若没有安装脚本或校验清单，请从 [Releases](https://github.com/9star-academy/proxctl/releases) 手动下载对应平台的文件。
 
 > **版本与环境**：源码中的改动需要发布后才会包含在安装包中。`daemon` 仅适用于使用 systemd 的 Linux，服务单元使用 [`Type=exec`](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Type=)，需要 systemd 支持该类型。
 
@@ -104,6 +105,8 @@ WebSocket 自动透传。从当前请求生成 `X-Forwarded-For`、`X-Forwarded-
 sudo proxctl static app.example.com --dir /var/www/app/dist --spa
 ```
 
+静态资源和 SPA 回退都限制在站点目录内。目录内的相对符号链接可以正常使用，指向目录外或使用绝对路径的符号链接会被拒绝。
+
 ### 添加访问认证
 
 ```bash
@@ -142,6 +145,7 @@ sudo proxctl rm admin.example.com
 | `proxctl add <域名> --to <目标>` | 添加或替换反向代理规则 | `--auth`、`--cors` |
 | `proxctl static <域名> --dir <目录>` | 添加或替换静态站点规则 | `--auth`、`--spa` |
 | `proxctl list` | 查看已配置的域名 | — |
+| `proxctl doctor <域名>` | 检查配置、DNS、后端与 HTTPS | `--expect-ip`、`--https-port` |
 | `proxctl rm <域名>` | 删除域名规则 | — |
 | `proxctl serve` | 前台运行代理服务 | — |
 | `proxctl daemon <操作>` | 管理 systemd 服务 | `install` / `start` / `stop` / `restart` / `status` |
@@ -168,7 +172,7 @@ sudo proxctl --config /etc/proxctl/custom.json daemon install
 sudo proxctl --config /etc/proxctl/custom.json list
 ```
 
-systemd 单元会保存安装时选定的配置路径。一个 `proxctl.service` 对应一个配置文件；对其他文件执行 `daemon install` 会替换该服务的配置并重启服务。
+systemd 单元会保存安装时选定的配置路径。一个 `proxctl.service` 对应一个配置文件；对其他文件执行 `daemon install` 会替换该服务的配置并重启服务。其余 `daemon` 操作直接管理已安装的服务，配置损坏时仍可查看状态或停止服务。
 
 ### 权限与规则重载
 
@@ -215,6 +219,20 @@ sudo journalctl -u proxctl -f
 
 ### 排障检查
 
+在运行 proxctl 的服务器上执行：
+
+```bash
+sudo proxctl doctor api.example.com
+sudo proxctl doctor api.example.com --expect-ip 203.0.113.10
+```
+
+- **配置**检查所选文件中是否有该域名。使用自定义配置时，在 `doctor` 前加 `--config <路径>`。
+- **DNS**显示当前解析到的 IPv4 / IPv6 地址。服务器使用 NAT 或 CDN 时，可用 `--expect-ip` 核对预期的公网或 CDN 地址。
+- **后端**检查 TCP 端口是否可连接。静态站点检查目录，SPA 另检查入口文件。
+- **HTTPS**默认连接域名的 443 端口，验证连接到的证书及其到期时间。使用其他对外端口时传入 `--https-port`。如果服务正在等待首次签发，这次连接可能触发自动申请。
+
+命令会分别标记正常、失败、待确认或跳过。发现失败时返回退出码 `1`。后端检查只验证 TCP 连通性，应用的 HTTP 响应可用下表中的 `curl` 继续确认。
+
 | 检查项 | 方法 |
 | --- | --- |
 | 服务是否运行 | `sudo proxctl daemon status` 或 `sudo systemctl status proxctl` |
@@ -229,13 +247,19 @@ sudo journalctl -u proxctl -f
 1. 升级前备份配置文件和证书目录。
 2. 安装新二进制后，执行 `sudo proxctl daemon restart`，使进程运行新代码。
 3. 检查服务状态、日志和 HTTPS 响应。
-4. 如需回滚，恢复旧二进制并重启服务。
+4. 如需回滚，可用同一个安装脚本指定旧 tag，再重启服务。较早、没有校验清单的版本可恢复备份的旧二进制。
+
+```bash
+# 将 <版本号> 替换为带有校验清单的 tag，例如 vX.Y.Z
+curl -fsSL https://github.com/9star-academy/proxctl/releases/latest/download/install.sh | sudo bash -s -- --version '<版本号>'
+sudo proxctl daemon restart
+```
 
 当前配置格式与 V1 保持兼容。原先运行的旧版进程需要先重启，才能启用规则自动重载。
 
 ### 当前功能边界
 
-暂不提供 `proxctl logs`、逐请求访问日志、证书有效期展示、Gzip/Brotli 压缩、请求限流或 ZeroSSL 配置入口。
+暂不提供 `proxctl logs`、逐请求访问日志、Gzip/Brotli 压缩、请求限流或 ZeroSSL 配置入口。
 
 ## 开发与验证
 
@@ -261,7 +285,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/proxctl-linux-arm64 ./cmd
 
 回归测试使用临时配置、本机 HTTP/HTTPS 服务、测试证书和模拟安装命令，覆盖规则重载/删除、配置损坏恢复、并发写入、权限迁移、转发头、认证 CORS、WebSocket 双向传输及失败退出码；不会申请公网证书或修改系统服务。[CI](.github/workflows/ci.yml) 在 Linux 和 macOS 上执行测试、race、vet 与跨平台构建。
 
-CI 另在临时 runner 上验证候选程序；[发布工作流](.github/workflows/release.yml) 则从公开的一键安装入口下载实际 Release 包，再验证前台服务、HTTPS、静态站点、反向代理、认证跨域和规则重载。Linux 验收还会安装并实际启动、停止、重启 systemd 服务，结束后清理测试配置。验收脚本为 [`scripts/verify-install.py`](scripts/verify-install.py)，其中 systemd 模式仅允许在全新的 Linux CI 环境执行。
+CI 在临时 runner 上验证候选程序。[发布工作流](.github/workflows/release.yml) 会先验收本次 tag 构建的实际二进制，再发布同一批文件。发布后从该 tag 的公开安装入口再验证一次。Linux 验收会安装并启动、停止、重启 systemd 服务，结束后清理测试配置。验收脚本为 [`scripts/verify-install.py`](scripts/verify-install.py)，其中 systemd 模式仅允许在全新的 Linux CI 环境执行。
 
 </details>
 

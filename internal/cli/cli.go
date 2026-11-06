@@ -21,6 +21,7 @@ const helpText = `proxctl — 一行命令搞定反向代理、静态站点托�
   proxctl add <域名> --to <目标地址> [选项]       添加反向代理（自动申请 HTTPS）
   proxctl static <域名> --dir <静态目录> [选项]   添加前端静态站点托管
   proxctl list                                   查看所有已配置的域名与状态
+  proxctl doctor <域名> [选项]                   检查 DNS、后端与 HTTPS
   proxctl rm <域名>                              删除域名配置
   proxctl serve                                 前台启动代理服务引擎
   proxctl daemon <install|start|stop|restart|status>  Linux systemd 管理
@@ -95,21 +96,17 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	case "-h", "--help", "help":
 		fmt.Fprint(a.Out, helpText)
 		return 0
-	case "add", "static", "rm", "delete", "list", "ls", "serve", "daemon":
+	case "daemon":
+		return a.runDaemon(ctx, subArgs, configPath)
+	case "doctor":
+		return a.runDoctor(ctx, subArgs, configPath)
+	case "add", "static", "rm", "delete", "list", "ls", "serve":
 	default:
 		fmt.Fprintf(a.Err, "未知命令: %s\n运行 'proxctl --help' 查看帮助\n", cmd)
 		return 1
 	}
-	if a.Config == nil || configPath != "" {
-		cfg, err := config.Load(configPath)
-		if err != nil {
-			fmt.Fprintf(a.Err, "加载配置失败: %v\n", err)
-			if errors.Is(err, os.ErrPermission) {
-				fmt.Fprintln(a.Err, "系统配置需要 sudo 权限；也可用 --config 明确选择自己的配置文件。")
-			}
-			return 1
-		}
-		a.Config = cfg
+	if !a.loadConfig(configPath) {
+		return 1
 	}
 
 	switch cmd {
@@ -127,11 +124,25 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		return a.runList(ctx)
 	case "serve":
 		return a.runServe(ctx, subArgs)
-	case "daemon":
-		return a.runDaemon(ctx, subArgs)
 	default:
 		return 1
 	}
+}
+
+func (a *App) loadConfig(path string) bool {
+	if a.Config != nil && path == "" {
+		return true
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		fmt.Fprintf(a.Err, "加载配置失败: %v\n", err)
+		if errors.Is(err, os.ErrPermission) {
+			fmt.Fprintln(a.Err, "系统配置需要 sudo 权限；也可用 --config 明确选择自己的配置文件。")
+		}
+		return false
+	}
+	a.Config = cfg
+	return true
 }
 
 func (a *App) runAdd(ctx context.Context, args []string) int {

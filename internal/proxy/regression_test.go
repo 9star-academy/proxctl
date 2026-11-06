@@ -1,10 +1,14 @@
 package proxy
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -96,5 +100,100 @@ func TestAuthenticatedCORS(t *testing.T) {
 				t.Fatal("Authorization missing from allowed headers")
 			}
 		})
+	}
+}
+
+func TestProxyFailureRedactsResponseAndLog(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		fmt.Fprint(conn, "raw-transport-secret\r\n")
+	}))
+	defer backend.Close()
+
+	authority := strings.TrimPrefix(backend.URL, "http://")
+	target := "http://review-user:review-password@" + authority + "/private-path?token=review-token"
+	cfg := testProxyConfig(t, target)
+	var logs bytes.Buffer
+	server := NewServer(cfg, log.New(&logs, "", 0))
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, httptest.NewRequest("GET", "https://api.local/", nil))
+
+	if w.Code != http.StatusBadGateway || w.Body.String() != "Bad Gateway\n" {
+		t.Errorf("response status=%d body=%q", w.Code, w.Body.String())
+	}
+	for _, marker := range []string{"review-user", "review-password", "private-path", "review-token", "raw-transport-secret"} {
+		if strings.Contains(logs.String(), marker) {
+			t.Errorf("logs contain %q: %s", marker, logs.String())
+		}
+	}
+	if !strings.Contains(logs.String(), "api.local") || !strings.Contains(logs.String(), authority) {
+		t.Errorf("logs are missing the affected domain or backend address: %s", logs.String())
+	}
+}
+
+func TestStaticSiteContainsSymlinks(t *testing.T) {
+	parent := t.TempDir()
+	site := filepath.Join(parent, "site")
+	if err := os.MkdirAll(filepath.Join(site, "nested"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{"private.txt": "outside marker", "site/index.html": "SPA marker", "site/asset.txt": "asset marker"} {
+		if err := os.WriteFile(filepath.Join(parent, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, target := range map[string]string{
+		"absolute.txt":      filepath.Join(parent, "private.txt"),
+		"relative.txt":      "../private.txt",
+		"outside":           "..",
+		"nested/index.html": "../../private.txt",
+		"inside.txt":        "asset.txt",
+	} {
+		if err := os.Symlink(target, filepath.Join(site, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := &config.Config{CertDir: t.TempDir()}
+	if err := cfg.AddRule(&config.Rule{Domain: "app.local", Type: config.TypeStatic, StaticDir: site, SPA: true}); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(cfg, nil)
+	for _, tc := range []struct {
+		path, wantBody string
+		wantStatus     int
+	}{
+		{"/absolute.txt", "", http.StatusForbidden},
+		{"/relative.txt", "", http.StatusForbidden},
+		{"/outside/private.txt", "", http.StatusForbidden},
+		{"/nested/", "", http.StatusForbidden},
+		{"/inside.txt", "asset marker", http.StatusOK},
+		{"/dashboard", "SPA marker", http.StatusOK},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			server.ServeHTTP(w, httptest.NewRequest("GET", "https://app.local"+tc.path, nil))
+			if w.Code != tc.wantStatus || (tc.wantBody != "" && w.Body.String() != tc.wantBody) || strings.Contains(w.Body.String(), "outside marker") {
+				t.Errorf("status=%d body=%q, want %d and %q", w.Code, w.Body.String(), tc.wantStatus, tc.wantBody)
+			}
+		})
+	}
+
+	index := filepath.Join(site, "index.html")
+	if err := os.Remove(index); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../private.txt", index); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, httptest.NewRequest("GET", "https://app.local/dashboard", nil))
+	if w.Code != http.StatusForbidden || strings.Contains(w.Body.String(), "outside marker") {
+		t.Errorf("escaped SPA index returned status=%d body=%q", w.Code, w.Body.String())
 	}
 }

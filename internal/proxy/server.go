@@ -5,17 +5,20 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"os"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/9star-academy/proxctl/internal/config"
@@ -266,9 +269,10 @@ func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request, rule *config
 			}
 		}}
 
-		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			s.Logger.Printf("代理请求失败 [%s -> %s]: %v", rule.Domain, rule.Target, err)
-			http.Error(w, fmt.Sprintf("proxctl: 无法连接目标后端 %s: %v", rule.Target, err), http.StatusBadGateway)
+		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+			// Upstream URLs and transport errors may contain credentials or tokens.
+			s.Logger.Printf("代理请求失败 [%s -> %s]: %s", rule.Domain, targetURL.Host, proxyErrorReason(err))
+			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		}
 
 		s.proxies.Store(rule.Domain, cachedProxy{target: rule.Target, proxy: proxy})
@@ -277,38 +281,63 @@ func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request, rule *config
 	proxy.ServeHTTP(w, r)
 }
 
+func proxyErrorReason(err error) string {
+	var dnsErr *net.DNSError
+	var certErr *tls.CertificateVerificationError
+	var netErr net.Error
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "请求已取消"
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "后端连接或响应超时"
+	case errors.As(err, &dnsErr):
+		return "后端 DNS 解析失败"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "后端拒绝连接"
+	case errors.As(err, &certErr):
+		return "后端 TLS 证书验证失败"
+	default:
+		return "后端连接或响应异常"
+	}
+}
+
 func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request, rule *config.Rule) {
-	dir := rule.StaticDir
-	fs := http.Dir(dir)
+	root, err := os.OpenRoot(rule.StaticDir)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer root.Close()
+	files := root.FS()
 
-	cleanPath := filepath.Clean(r.URL.Path)
-	localPath := filepath.Join(dir, cleanPath)
-
-	fi, err := os.Stat(localPath)
-	if err == nil && !fi.IsDir() {
-		http.FileServer(fs).ServeHTTP(w, r)
+	name := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+	if name == "" {
+		name = "."
+	}
+	info, err := fs.Stat(files, name)
+	if err == nil && info.IsDir() {
+		_, err = fs.Stat(files, path.Join(name, "index.html"))
+	}
+	if err != nil && !isMissingStaticFile(err) {
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 		return
 	}
 
-	// Check if directory has index.html
-	if err == nil && fi.IsDir() {
-		indexPath := filepath.Join(localPath, "index.html")
-		if _, err := os.Stat(indexPath); err == nil {
-			http.FileServer(fs).ServeHTTP(w, r)
+	if rule.SPA && err != nil {
+		if _, err := fs.Stat(files, "index.html"); err == nil {
+			http.ServeFileFS(w, r, files, "index.html")
+			return
+		} else if !isMissingStaticFile(err) {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
 	}
 
-	// If SPA mode is enabled and file not found, serve index.html
-	if rule.SPA {
-		rootIndex := filepath.Join(dir, "index.html")
-		if _, err := os.Stat(rootIndex); err == nil {
-			http.ServeFile(w, r, rootIndex)
-			return
-		}
-	}
+	http.FileServerFS(files).ServeHTTP(w, r)
+}
 
-	http.FileServer(fs).ServeHTTP(w, r)
+func isMissingStaticFile(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
 }
 
 func checkBasicAuth(r *http.Request, expected string) bool {

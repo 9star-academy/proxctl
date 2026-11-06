@@ -27,18 +27,8 @@ func validateRule(rule *Rule) error {
 	if rule == nil {
 		return fmt.Errorf("规则不能为空")
 	}
-	if rule.Domain == "" || len(rule.Domain) > 253 {
-		return fmt.Errorf("域名无效")
-	}
-	for _, label := range strings.Split(rule.Domain, ".") {
-		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return fmt.Errorf("域名无效: %s", rule.Domain)
-		}
-		for _, c := range label {
-			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
-				return fmt.Errorf("域名无效: %s", rule.Domain)
-			}
-		}
+	if err := ValidateDomain(rule.Domain); err != nil {
+		return err
 	}
 	if rule.Auth != "" {
 		parts := strings.SplitN(rule.Auth, ":", 2)
@@ -56,6 +46,24 @@ func validateRule(rule *Rule) error {
 		}
 	default:
 		return fmt.Errorf("不支持的规则类型: %s", rule.Type)
+	}
+	return nil
+}
+
+// ValidateDomain checks a canonical domain name used as a rule key.
+func ValidateDomain(domain string) error {
+	if domain == "" || len(domain) > 253 {
+		return fmt.Errorf("域名无效")
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("域名无效: %q", domain)
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return fmt.Errorf("域名无效: %q", domain)
+			}
+		}
 	}
 	return nil
 }
